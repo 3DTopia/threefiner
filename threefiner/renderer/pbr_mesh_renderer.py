@@ -1,0 +1,300 @@
+import os
+import tqdm
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import envlight
+
+import nvdiffrast.torch as dr
+
+from kiui.mesh import Mesh
+from kiui.mesh_utils import clean_mesh, decimate_mesh
+from kiui.op import safe_normalize, scale_img_hwc, make_divisible, uv_padding
+from kiui.cam import orbit_camera, get_perspective
+from threefiner.nn import MLP, HashGridEncoder, FrequencyEncoder, TriplaneEncoder
+from threefiner.renderer.mesh_renderer import render_mesh
+
+
+class Renderer(nn.Module):
+    def __init__(self, opt, device):
+        
+        super().__init__()
+
+        self.opt = opt
+        self.device = device
+
+        # it's necessary to clean the mesh to facilitate later remeshing!
+        self.mesh = Mesh.load(self.opt.mesh, bound=0.9, clean=True, front_dir=self.opt.front_dir)
+
+        if not self.opt.force_cuda_rast and (not self.opt.gui or os.name == 'nt'):
+            self.glctx = dr.RasterizeGLContext()
+        else:
+            self.glctx = dr.RasterizeCudaContext()
+        
+        # extract trainable parameters
+        self.v_offsets = nn.Parameter(torch.zeros_like(self.mesh.v))
+        
+        # texture
+        if self.opt.tex_mode == 'hashgrid':
+            self.encoder = HashGridEncoder().to(self.device)
+        elif self.opt.tex_mode == 'mlp':
+            self.encoder = FrequencyEncoder().to(self.device)
+        elif self.opt.tex_mode == 'triplane':
+            self.encoder = TriplaneEncoder().to(self.device)
+        else:
+            raise NotImplementedError(f"unsupported texture mode: {self.opt.tex_mode} for {self.opt.geom_mode}")
+        
+        self.mlp = MLP(self.encoder.output_dim, 3+2, 32, 2, bias=True).to(self.device)
+
+        # env light
+        if self.opt.env_texture is None:
+            hdr_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../lights/mud_road_puresky_1k.hdr')
+        else:
+            hdr_path = self.opt.env_texture
+        self.light = envlight.EnvLight(hdr_path, scale=self.opt.env_scale, device=self.device)
+
+        FG_LUT = torch.from_numpy(np.fromfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../lights/bsdf_256_256.bin"), dtype=np.float32).reshape(1, 256, 256, 2)).to(self.device)
+        self.register_buffer("FG_LUT", FG_LUT)
+
+        # init hashgrid texture from mesh
+        if self.opt.fit_tex:
+            self.fit_texture_from_mesh(self.opt.fit_tex_iters)
+
+    def render_mesh(self, pose, proj, h, w, ssaa=1, bg_color=1):
+        return render_mesh(
+            self.glctx, 
+            self.mesh.v, self.mesh.f, self.mesh.vt, 
+            self.mesh.ft, self.mesh.albedo, 
+            self.mesh.vc, self.mesh.vn, self.mesh.fn, 
+            pose, proj, h, w, 
+            ssaa=ssaa, bg_color=bg_color,
+        )
+    
+    def fit_texture_from_mesh(self, iters=512):
+        # a small training loop...
+
+        loss_fn = torch.nn.MSELoss()
+        optimizer = torch.optim.Adam([
+            {'params': self.encoder.parameters(), 'lr': self.opt.hashgrid_lr},
+            {'params': self.mlp.parameters(), 'lr': self.opt.mlp_lr},
+        ])
+
+        resolution = 512
+
+        print(f"[INFO] fitting texture...")
+        pbar = tqdm.trange(iters)
+        for i in pbar:
+
+            ver = np.random.randint(-45, 45)
+            hor = np.random.randint(-180, 180)
+            
+            pose = orbit_camera(ver, hor, self.opt.radius)
+            proj = get_perspective(self.opt.fovy)
+
+            image_mesh = self.render_mesh(pose, proj, resolution, resolution)['image']
+            image_pred = self.render(pose, proj, resolution, resolution)['image']
+
+            loss = loss_fn(image_pred, image_mesh)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            pbar.set_description(f"MSE = {loss.item():.6f}")
+        
+        print(f"[INFO] finished fitting texture!")
+
+    def get_params(self):
+
+        params = [
+            {'params': self.encoder.parameters(), 'lr': self.opt.hashgrid_lr},
+            {'params': self.mlp.parameters(), 'lr': self.opt.mlp_lr},
+        ]
+
+        if not self.opt.fix_geo:
+            params.append({'params': self.v_offsets, 'lr': self.opt.geom_lr})
+
+        return params
+
+    @torch.no_grad()
+    def export_mesh(self, save_path, texture_resolution=2048, padding=2):
+
+        mesh = Mesh(v=self.v, f=self.f, albedo=None, device=self.device)
+        print(f"[INFO] uv unwrapping...")
+        mesh.auto_normal()
+        mesh.auto_uv()
+
+        # render uv maps
+        h = w = texture_resolution
+        uv = mesh.vt * 2.0 - 1.0 # uvs to range [-1, 1]
+        uv = torch.cat((uv, torch.zeros_like(uv[..., :1]), torch.ones_like(uv[..., :1])), dim=-1) # [N, 4]
+
+        rast, _ = dr.rasterize(self.glctx, uv.unsqueeze(0), mesh.ft, (h, w)) # [1, h, w, 4]
+
+        # masked query 
+        xyzs, _ = dr.interpolate(mesh.v.unsqueeze(0), rast, mesh.f) # [1, h, w, 3]
+        mask, _ = dr.interpolate(torch.ones_like(mesh.v[:, :1]).unsqueeze(0), rast, mesh.f) # [1, h, w, 1]
+        xyzs = xyzs.view(-1, 3)
+        mask = (mask > 0).view(-1)
+        
+        material = torch.zeros(h * w, 5, device=self.device, dtype=torch.float32)
+
+        if mask.any():
+            print(f"[INFO] querying texture...")
+
+            xyzs = xyzs[mask] # [M, 3]
+
+            # batched inference to avoid OOM
+            batch = []
+            head = 0
+            while head < xyzs.shape[0]:
+                tail = min(head + 640000, xyzs.shape[0])
+                batch.append(torch.sigmoid(self.mlp(self.encoder(xyzs[head:tail]))).float())
+                head += 640000
+
+            material[mask] = torch.cat(batch, dim=0)
+        
+        material = material.view(h, w, -1)
+        mask = mask.view(h, w)
+
+        print(f"[INFO] uv padding...")
+        material = uv_padding(material, mask, padding)
+
+        mesh.albedo = material[..., :3]
+        mesh.metallicRoughness = torch.cat([torch.zeros_like(material[..., 3:4]), material[..., 4:5], material[..., 3:4]], dim=-1)
+        mesh.write(save_path)
+
+    @property
+    def v(self):
+        if self.opt.fix_geo:
+            return self.mesh.v
+        else:
+            return self.mesh.v + self.v_offsets
+    
+    @property
+    def f(self):
+        return self.mesh.f
+    
+    @torch.no_grad()
+    def remesh(self):
+        vertices = self.v.detach().cpu().numpy()
+        triangles = self.f.detach().cpu().numpy()
+        vertices, triangles = clean_mesh(vertices, triangles, remesh=True, remesh_size=self.opt.remesh_size)
+        if self.opt.decimate_target > 0 and triangles.shape[0] > self.opt.decimate_target:
+            vertices, triangles = decimate_mesh(vertices, triangles, self.opt.decimate_target, optimalplacement=False)
+        self.mesh.v = torch.from_numpy(vertices).contiguous().float().to(self.device)
+        self.mesh.f = torch.from_numpy(triangles).contiguous().int().to(self.device)
+        self.v_offsets = nn.Parameter(torch.zeros_like(self.mesh.v)).to(self.device)
+    
+    def render(self, pose, proj, h0, w0, ssaa=1, bg_color=1):
+
+        # do super-sampling
+        if ssaa != 1:
+            h = make_divisible(h0 * ssaa, 8)
+            w = make_divisible(w0 * ssaa, 8)
+        else:
+            h, w = h0, w0
+        
+        results = {}
+
+        # get v
+        v = self.v
+        f = self.f
+
+        pose = torch.from_numpy(pose.astype(np.float32)).to(v.device)
+        proj = torch.from_numpy(proj.astype(np.float32)).to(v.device)
+
+        # get v_clip and render rgb
+        v_cam = torch.matmul(F.pad(v, pad=(0, 1), mode='constant', value=1.0), torch.inverse(pose).T).float().unsqueeze(0)
+        v_clip = v_cam @ proj.T
+
+        rast, rast_db = dr.rasterize(self.glctx, v_clip, f, (h, w))
+
+        alpha = torch.clamp(rast[..., -1:], 0, 1).contiguous() # [1, H, W, 1]
+        alpha = dr.antialias(alpha, rast, v_clip, f).clamp(0, 1).squeeze(0) # important to enable gradients!
+
+        depth, _ = dr.interpolate(-v_cam[..., [2]], rast, f) # [1, H, W, 1]
+        depth = depth.squeeze(0) # [H, W, 1]
+
+        xyzs, _ = dr.interpolate(v.unsqueeze(0), rast, f) # [1, H, W, 3]
+        viewdir = safe_normalize(xyzs - pose[:3, 3]).squeeze(0)
+
+        xyzs = xyzs.view(-1, 3)
+        mask = (alpha > 0).view(-1)
+        material = torch.zeros(xyzs.shape[0], 5, dtype=torch.float32, device=xyzs.device)
+        if mask.any():
+            masked_material = torch.sigmoid(self.mlp(self.encoder(xyzs[mask], bound=1)))
+            material[mask] = masked_material.float()
+        material = material.view(h, w, -1)
+        
+        # get vn and render normal
+        if self.opt.fix_geo:
+            vn = self.mesh.vn
+        else:
+            i0, i1, i2 = f[:, 0].long(), f[:, 1].long(), f[:, 2].long()
+            v0, v1, v2 = v[i0, :], v[i1, :], v[i2, :]
+
+            face_normals = torch.cross(v1 - v0, v2 - v0)
+            face_normals = safe_normalize(face_normals)
+
+            vn = torch.zeros_like(v)
+            vn.scatter_add_(0, i0[:, None].repeat(1,3), face_normals)
+            vn.scatter_add_(0, i1[:, None].repeat(1,3), face_normals)
+            vn.scatter_add_(0, i2[:, None].repeat(1,3), face_normals)
+
+            vn = torch.where(torch.sum(vn * vn, -1, keepdim=True) > 1e-20, vn, torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=vn.device))
+
+        normal, _ = dr.interpolate(vn.unsqueeze(0).contiguous(), rast, f)
+        normal = safe_normalize(normal[0])
+
+        # rotated normal (where [0, 0, 1] always faces camera)
+        rot_normal = normal @ pose[:3, :3]
+        viewcos = rot_normal[..., [2]]
+
+        # shading
+        albedo = material[..., :3]
+        metallic = material[..., 3:4]
+        roughness = material[..., 4:5]
+
+        n_dot_v = (normal * viewdir).sum(-1, keepdim=True) # [H, W, 1]
+        reflective = n_dot_v * normal * 2 - viewdir
+
+        diffuse_albedo = (1 - metallic) * albedo
+
+        fg_uv = torch.cat([n_dot_v, roughness], -1).clamp(0, 1) # [H, W, 2]
+        fg = dr.texture(
+            self.FG_LUT,
+            fg_uv.reshape(1, -1, 1, 2).contiguous(),
+            filter_mode="linear",
+            boundary_mode="clamp",
+        ).reshape(h, w, 2)
+        F0 = (1 - metallic) * 0.04 + metallic * albedo
+        specular_albedo = F0 * fg[..., 0:1] + fg[..., 1:2]
+
+        diffuse_light = self.light(normal)
+        specular_light = self.light(reflective, roughness)
+
+        color = diffuse_albedo * diffuse_light + specular_albedo * specular_light # [H, W, 3]
+
+        # antialias
+        color = dr.antialias(color.unsqueeze(0), rast, v_clip, f).clamp(0, 1).squeeze(0) # [H, W, 3]
+        color = alpha * color + (1 - alpha) * bg_color
+
+        # ssaa
+        if ssaa != 1:
+            color = scale_img_hwc(color, (h0, w0))
+            alpha = scale_img_hwc(alpha, (h0, w0))
+            depth = scale_img_hwc(depth, (h0, w0))
+            normal = scale_img_hwc(normal, (h0, w0))
+            viewcos = scale_img_hwc(viewcos, (h0, w0))
+
+        results['image'] = color
+        results['alpha'] = alpha
+        results['depth'] = depth
+        results['normal'] = (normal + 1) / 2
+        results['viewcos'] = viewcos
+
+        return results

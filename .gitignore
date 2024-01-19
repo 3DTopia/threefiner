@@ -1,0 +1,10 @@
+__pycache__
+tmp*
+data_*
+logs
+logs*
+videos*
+
+
+*.egg-info
+build/
