@@ -62,6 +62,7 @@ class Renderer(nn.Module):
             sdf_func = SDF(mesh.v.detach().cpu().numpy(), mesh.f.detach().cpu().numpy())
             sdf = sdf_func(self.verts.detach().cpu().numpy().reshape(-1, 3))
             sdf = torch.from_numpy(sdf).to(self.device)
+            sdf *= -1
 
         # OUTER is POSITIVE
         self.sdf.data += sdf.reshape(*self.sdf.data.shape).to(self.sdf.data.dtype)

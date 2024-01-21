@@ -16,8 +16,9 @@ setup(
   description = 'Threefiner: a text-guided mesh refiner',
   author = 'kiui',
   author_email = 'ashawkey1999@gmail.com',
+  long_description=open("readme.md", encoding="utf-8").read(),
   long_description_content_type = 'text/markdown',
-  url = 'https://github.com/ashawkey/threefiner',
+  url = 'https://github.com/3DTopia/threefiner',
   keywords = [
     'generative mesh refinement',
   ],
