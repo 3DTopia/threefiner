@@ -11,7 +11,7 @@ setup(
       'threefiner = threefiner.cli:main'
     ],
   },
-  version = '0.1.0',
+  version = '0.1.1',
   license='MIT',
   description = 'Threefiner: a text-guided mesh refiner',
   author = 'kiui',
