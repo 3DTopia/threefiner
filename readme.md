@@ -8,7 +8,7 @@
 
 An interface for text-guided mesh refinement.
 
-https://github.com/ashawkey/threefiner/assets/25863658/01cedb7a-65b1-46cb-92cc-1ca872ac4e72
+https://github.com/3DTopia/threefiner/assets/25863658/a4abe725-b542-4a4a-a6d4-e4c4821f7d96
 
 ### Features
 * **Mesh in, mesh out**: we support `ply` with vertex colors, `obj`, and single object `glb/gltf` with textures!
@@ -34,7 +34,7 @@ To use [Deepfloyd-IF](https://github.com/deep-floyd/IF) models, please log in to
 To install this package:
 ```bash
 # install from pypi
-# pip install threefiner # not available yet
+pip install threefiner
 
 # install from github
 pip install git+https://github.com/ashawkey/threefiner
@@ -95,7 +95,7 @@ For more examples, please see [scripts](./scripts/).
 You may first visualize it in a 3D viewer that follows OpenGL coordinate system:
 <p align="center">
     <picture>
-    <img alt="logo" src="assets/coord.jpg" width="50%">
+    <img alt="example_front_dir" src="assets/coord.jpg" width="50%">
     </picture>
 </p>
 The chair is facing down the Y axis (Green), so we can use `--front_dir="-y"` to rectify it to face +Z axis (Blue).
