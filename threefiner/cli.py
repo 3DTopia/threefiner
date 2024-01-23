@@ -8,7 +8,7 @@ def main():
     opt = tyro.cli(tyro.extras.subcommand_type_from_defaults(config_defaults, config_doc))
     opt = check_options(opt)
     gui = GUI(opt)
-    if opt.gui:
+    if gui.gui:
         gui.render()
     else:
         gui.train(opt.iters)
