@@ -90,15 +90,21 @@ For more examples, please see [scripts](./scripts/).
 
 ### Q&A
 
-**How to make sure `--front_dir` for your model?**
+* **How to make sure `--front_dir` for your model?**
+    
+    You may first visualize it in a 3D viewer that follows OpenGL coordinate system:
+    <p align="center">
+        <picture>
+        <img alt="example_front_dir" src="assets/coord.jpg" width="50%">
+        </picture>
+    </p>
+    The chair is facing down the Y axis (Green), so we can use `--front_dir="-y"` to rectify it to face +Z axis (Blue).
 
-You may first visualize it in a 3D viewer that follows OpenGL coordinate system:
-<p align="center">
-    <picture>
-    <img alt="example_front_dir" src="assets/coord.jpg" width="50%">
-    </picture>
-</p>
-The chair is facing down the Y axis (Green), so we can use `--front_dir="-y"` to rectify it to face +Z axis (Blue).
+* **fatal error: EGL/egl.h: No such file or directory**
+
+    By default, we use the OpenGL rasterizer. This error means there is no OpenGL installation, which is often the case for headless servers.
+    It's recommended to install OpenGL (along with NVIDIA driver) as it brings better performance.
+    Otherwise, you can append `--force_cuda_rast` to use the CUDA rasterizer instead.
 
 ## Acknowledgement
 
