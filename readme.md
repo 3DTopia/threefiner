@@ -37,10 +37,10 @@ To install this package:
 pip install threefiner
 
 # install from github
-pip install git+https://github.com/ashawkey/threefiner
+pip install git+https://github.com/3DTopia/threefiner
 
 # local install
-git clone https://github.com/ashawkey/threefiner
+git clone https://github.com/3DTopia/threefiner
 cd threefiner
 pip install .
 ```
