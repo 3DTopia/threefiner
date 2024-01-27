@@ -109,8 +109,14 @@ class Renderer(nn.Module):
         self.opt = opt
         self.device = device
 
+        self.mesh = Mesh.load(self.opt.mesh, bound=0.9, front_dir=self.opt.front_dir)
+
         # it's necessary to clean the mesh to facilitate later remeshing!
-        self.mesh = Mesh.load(self.opt.mesh, bound=0.9, clean=True, front_dir=self.opt.front_dir)
+        vertices = self.mesh.v.detach().cpu().numpy()
+        triangles = self.mesh.f.detach().cpu().numpy()
+        vertices, triangles = clean_mesh(vertices, triangles, min_f=32, min_d=10, remesh=False)
+        self.mesh.v = torch.from_numpy(vertices).contiguous().float().to(self.device)
+        self.mesh.f = torch.from_numpy(triangles).contiguous().int().to(self.device)
 
         if not self.opt.force_cuda_rast and (not self.opt.gui or os.name == 'nt'):
             self.glctx = dr.RasterizeGLContext()
@@ -193,7 +199,7 @@ class Renderer(nn.Module):
         return params
 
     @torch.no_grad()
-    def export_mesh(self, save_path, texture_resolution=2048, padding=2):
+    def export_mesh(self, save_path, texture_resolution=2048, padding=16):
 
         mesh = Mesh(v=self.v, f=self.f, albedo=None, device=self.device)
         print(f"[INFO] uv unwrapping...")

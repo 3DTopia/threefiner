@@ -1,6 +1,7 @@
 import os
 import tqdm
 import random
+import imageio
 import numpy as np
 
 import torch
@@ -54,7 +55,12 @@ class GUI:
         else:
             raise NotImplementedError(f"unknown geometry mode: {self.opt.geom_mode}")
 
-        self.renderer = Renderer(opt, self.device).to(self.device)
+        self.renderer_class = Renderer
+        
+        if self.opt.mesh is None:
+            self.renderer = None
+        else:
+            self.renderer = Renderer(opt, self.device).to(self.device)
 
         # input prompt
         self.prompt = self.opt.prompt
@@ -95,6 +101,8 @@ class GUI:
 
     def prepare_train(self):
 
+        assert self.renderer is not None, 'no mesh loaded!'
+
         self.step = 0
 
         # setup training
@@ -105,28 +113,28 @@ class GUI:
             print(f"[INFO] loading guidance...")
             if self.opt.mode == 'SD':
                 from threefiner.guidance.sd_utils import StableDiffusion
-                self.guidance = StableDiffusion(self.device)
+                self.guidance = StableDiffusion(self.device, vram_O=self.opt.vram_O)
             elif self.opt.mode == 'SD_NFSD':
                 from threefiner.guidance.sd_nfsd_utils import StableDiffusion
-                self.guidance = StableDiffusion(self.device)
+                self.guidance = StableDiffusion(self.device, vram_O=self.opt.vram_O)
             elif self.opt.mode == 'SDCN':
                 from threefiner.guidance.sdcn_utils import StableDiffusionControlNet
-                self.guidance = StableDiffusionControlNet(self.device)
+                self.guidance = StableDiffusionControlNet(self.device, vram_O=self.opt.vram_O)
             elif self.opt.mode == 'IF':
                 from threefiner.guidance.if_utils import IF
-                self.guidance = IF(self.device)
+                self.guidance = IF(self.device, vram_O=self.opt.vram_O)
             elif self.opt.mode == 'IF2':
                 from threefiner.guidance.if2_utils import IF2
-                self.guidance = IF2(self.device)
+                self.guidance = IF2(self.device, vram_O=self.opt.vram_O)
             elif self.opt.mode == 'IF2_NFSD':
                 from threefiner.guidance.if2_nfsd_utils import IF2
-                self.guidance = IF2(self.device)
+                self.guidance = IF2(self.device, vram_O=self.opt.vram_O)
             elif self.opt.mode == 'SD_ISM':
                 from threefiner.guidance.sd_ism_utils import StableDiffusion
-                self.guidance = StableDiffusion(self.device)
+                self.guidance = StableDiffusion(self.device, vram_O=self.opt.vram_O)
             elif self.opt.mode == 'IF2_ISM':
                 from threefiner.guidance.if2_ism_utils import IF2
-                self.guidance = IF2(self.device)
+                self.guidance = IF2(self.device, vram_O=self.opt.vram_O)
             else:
                 raise NotImplementedError(f"unknown guidance mode {self.opt.mode}!")
             print(f"[INFO] loaded guidance!")
@@ -286,9 +294,29 @@ class GUI:
                 "_texture", self.buffer_image
             )  # buffer must be contiguous, else seg fault!
 
-    def save_model(self):
-        self.renderer.export_mesh(self.save_path, texture_resolution=self.opt.texture_resolution)
-        print(f"[INFO] save model to {self.save_path}.")
+    def save_model(self, save_path=None):
+
+        if save_path is None:
+            save_path = self.save_path
+
+        # export video
+        if save_path.endswith(".mp4"):
+            images = []
+            elevation = 0
+            azimuth = np.arange(0, 360, 3, dtype=np.int32) # front-->back-->front
+            for azi in tqdm.tqdm(azimuth):
+                pose = orbit_camera(elevation, azi, self.opt.radius)
+                out = self.renderer.render(pose, self.cam.perspective, self.opt.render_resolution, self.opt.render_resolution, ssaa=1)    
+                image = (out["image"].detach().cpu().numpy() * 255).astype(np.uint8)
+                images.append(image)
+            images = np.stack(images, axis=0)
+            # ~4 seconds, 120 frames at 30 fps
+            imageio.mimwrite(save_path, images, fps=30, quality=8, macro_block_size=1)
+        # export mesh
+        else:
+            self.renderer.export_mesh(save_path, texture_resolution=self.opt.texture_resolution)
+
+        print(f"[INFO] save model to {save_path}.")
 
     def register_dpg(self):
         ### register texture
@@ -509,13 +537,6 @@ class GUI:
 
             self.cam.pan(dx, dy)
             self.need_update = True
-
-        def callback_set_mouse_loc(sender, app_data):
-            if not dpg.is_item_focused("_primary_window"):
-                return
-
-            # just the pixel coordinate in image
-            self.mouse_loc = np.array(app_data)
 
         with dpg.handler_registry():
             # for camera moving

@@ -51,17 +51,24 @@ class Renderer(nn.Module):
         self.deform = nn.Parameter(torch.zeros_like(self.verts))
         
         # init diffmc from mesh
-        mesh = Mesh.load(self.opt.mesh, bound=0.9, front_dir=self.opt.front_dir)
-        self.grid_scale = mesh.v.abs().max() + 1e-1
+        self.mesh = Mesh.load(self.opt.mesh, bound=0.9, front_dir=self.opt.front_dir)
+
+        vertices = self.mesh.v.detach().cpu().numpy()
+        triangles = self.mesh.f.detach().cpu().numpy()
+        vertices, triangles = clean_mesh(vertices, triangles, min_f=32, min_d=10, remesh=False)
+        self.mesh.v = torch.from_numpy(vertices).contiguous().float().to(self.device)
+        self.mesh.f = torch.from_numpy(triangles).contiguous().int().to(self.device)
+
+        self.grid_scale = self.mesh.v.abs().max() + 1e-1
         self.verts = self.verts * self.grid_scale
         
         try:
             import cubvh
-            BVH = cubvh.cuBVH(mesh.v, mesh.f)
+            BVH = cubvh.cuBVH(self.mesh.v, self.mesh.f)
             sdf, _, _ = BVH.signed_distance(self.verts.reshape(-1, 3), return_uvw=False, mode='raystab') # some mesh may not be watertight...
         except:
             from pysdf import SDF
-            sdf_func = SDF(mesh.v.detach().cpu().numpy(), mesh.f.detach().cpu().numpy())
+            sdf_func = SDF(self.mesh.v.detach().cpu().numpy(), self.mesh.f.detach().cpu().numpy())
             sdf = sdf_func(self.verts.detach().cpu().numpy().reshape(-1, 3))
             sdf = torch.from_numpy(sdf).to(self.device)
             sdf *= -1
@@ -80,8 +87,6 @@ class Renderer(nn.Module):
             raise NotImplementedError(f"unsupported texture mode: {self.opt.tex_mode} for {self.opt.geom_mode}")
         
         self.mlp = MLP(self.encoder.output_dim, 3+2, 32, 2, bias=True).to(self.device)
-
-        self.mesh = mesh # keep the original mesh!
 
         self.v, self.f = None, None # placeholder
 
@@ -157,7 +162,7 @@ class Renderer(nn.Module):
         return params
 
     @torch.no_grad()
-    def export_mesh(self, save_path, texture_resolution=2048, padding=2):
+    def export_mesh(self, save_path, texture_resolution=2048, padding=16):
 
         # get v
         sdf = self.sdf

@@ -39,6 +39,7 @@ class IF2(nn.Module):
             pipe.unet.to(memory_format=torch.channels_last)
             pipe.enable_attention_slicing(1)
             # pipe.enable_model_cpu_offload()
+            pipe.enable_sequential_cpu_offload()
         else:
             pipe.to(device)
 

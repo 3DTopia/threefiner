@@ -91,6 +91,8 @@ class Options:
     W: int = 800
     # whether to use CUDA rasterizer (in case OpenGL fails)
     force_cuda_rast: bool = False
+    # whether to use GPU memory-optimized mode (slower, but uses less GPU memory)
+    vram_O: bool = False
 
 
 # all the default settings

@@ -86,6 +86,12 @@ threefiner if2 --fix-geo --geom_mode mesh --mesh input.glb --prompt 'description
 threefiner if2 --mesh input.glb --prompt 'description' --gui
 ```
 
+Gradio demo:
+```bash
+# requires gradio 4
+python gradio_app.py if2
+```
+
 For more examples, please see [scripts](./scripts/).
 
 ### Q&A
